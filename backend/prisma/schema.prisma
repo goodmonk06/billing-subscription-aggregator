@@ -1,0 +1,142 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PaymentProvider {
+  STRIPE
+  PAYPAL
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELED
+  PAST_DUE
+  UNPAID
+  TRIALING
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+}
+
+enum BillingInterval {
+  MONTH
+  YEAR
+}
+
+enum PaymentEventType {
+  CUSTOMER_CREATED
+  CUSTOMER_UPDATED
+  SUBSCRIPTION_CREATED
+  SUBSCRIPTION_UPDATED
+  SUBSCRIPTION_DELETED
+  INVOICE_PAID
+  INVOICE_PAYMENT_FAILED
+  PAYMENT_METHOD_ATTACHED
+  PAYMENT_METHOD_DETACHED
+}
+
+model Tenant {
+  id            String         @id @default(cuid())
+  name          String
+  apiKey        String         @unique @default(cuid())
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  customers     Customer[]
+  plans         Plan[]
+  subscriptions Subscription[]
+  paymentEvents PaymentEvent[]
+
+  @@map("tenants")
+}
+
+model Customer {
+  id                 String          @id @default(cuid())
+  tenantId           String
+  externalCustomerId String          // Stripe customer ID or PayPal customer ID
+  provider           PaymentProvider
+  email              String
+  metadataJson       Json?           // Store additional customer metadata
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  subscriptions Subscription[]
+
+  @@unique([tenantId, externalCustomerId, provider])
+  @@index([tenantId])
+  @@index([email])
+  @@map("customers")
+}
+
+model Plan {
+  id                 String          @id @default(cuid())
+  tenantId           String
+  name               String
+  price              Int             // Store in smallest currency unit (cents)
+  currency           String          @default("usd")
+  billingInterval    BillingInterval
+  providerPlanIdsJson Json           // { "stripe": "price_xxx", "paypal": "plan_xxx" }
+  description        String?
+  isActive           Boolean         @default(true)
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  subscriptions Subscription[]
+
+  @@index([tenantId])
+  @@map("plans")
+}
+
+model Subscription {
+  id                     String             @id @default(cuid())
+  tenantId               String
+  customerId             String
+  planId                 String
+  status                 SubscriptionStatus
+  currentPeriodStart     DateTime
+  currentPeriodEnd       DateTime
+  cancelAt               DateTime?
+  canceledAt             DateTime?
+  providerSubscriptionId String             // Stripe subscription ID or PayPal subscription ID
+  provider               PaymentProvider
+  metadataJson           Json?              // Store additional subscription metadata
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  plan     Plan     @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@unique([providerSubscriptionId, provider])
+  @@index([tenantId])
+  @@index([customerId])
+  @@index([status])
+  @@map("subscriptions")
+}
+
+model PaymentEvent {
+  id          String           @id @default(cuid())
+  tenantId    String
+  provider    PaymentProvider
+  type        PaymentEventType
+  payloadJson Json             // Store the full webhook payload
+  processedAt DateTime?
+  createdAt   DateTime         @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([provider])
+  @@index([type])
+  @@index([createdAt])
+  @@map("payment_events")
+}
