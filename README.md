@@ -34,26 +34,48 @@ This system provides a multi-tenant billing aggregation layer that:
 
 ## Domain Model Summary
 
-### Core Entities
+### Core Entities (13 Models)
 
 ```
 Tenant (Multi-tenant isolation)
 ├── Plan (Billing plans with provider mappings)
 ├── Customer (End users with provider IDs)
+│   ├── PaymentMethod (Customer payment methods)
+│   ├── Credit (Account credits and promotional balances)
+│   └── UsageRecord (Metered usage tracking)
 ├── Subscription (Active subscriptions)
+│   └── UsageRecord (Usage-based billing)
+├── Invoice (Billing invoices)
+│   └── InvoiceLineItem (Invoice line items)
+├── Transaction (Payment/refund tracking)
+├── Webhook (Webhook delivery tracking)
+├── AuditLog (Comprehensive audit trails)
 └── PaymentEvent (Webhook event log)
 ```
 
 ### Key Relationships
-- **Tenant** → Many Plans, Customers, Subscriptions
-- **Customer** → Many Subscriptions (one per plan)
+- **Tenant** → Many Plans, Customers, Subscriptions, Invoices, Transactions
+- **Customer** → Many Subscriptions, Invoices, PaymentMethods, Transactions
 - **Plan** → Many Subscriptions
-- **Subscription** → References Customer, Plan, and Provider
+- **Subscription** → References Customer, Plan, Provider; has UsageRecords
+- **Invoice** → Has InvoiceLineItems, linked to Subscription and Customer
+- **Transaction** → Tracks payments, refunds, payouts for Invoices
+- **PaymentMethod** → Customer payment instruments (cards, bank accounts)
 
 ### Provider Abstraction
 - **IPaymentProvider** interface defines: createCustomer, createSubscription, cancelSubscription, syncSubscriptionFromWebhook
 - **StripeProvider**: Fully implemented
 - **PayPalProvider**: Stub with clear TODOs
+
+### Event-Driven Architecture
+- **DomainEventEmitter**: Event-driven system with typed domain events
+- **Domain Events**: 20+ event types (invoice.paid, payment.failed, usage.threshold_reached, etc.)
+- **Event Handlers**: Pluggable handlers for workflow automation
+
+### Adapter Pattern
+- **INotificationAdapter**: Email, SMS, push notification abstraction
+- **IMetricsAdapter**: Metrics and observability abstraction
+- In-memory implementations provided for development
 
 ## Getting Started
 
@@ -236,6 +258,108 @@ curl http://localhost:3000/tenants
 curl http://localhost:3000/tenants/{tenant-id}/subscriptions
 ```
 
+## Advanced Features
+
+### Invoice Management
+
+Create and manage invoices with line items:
+
+```bash
+# Create an invoice
+curl -X POST http://localhost:3000/invoices \
+  -H "Content-Type: application/json" \
+  -H "x-tenant-id: tenant_xxx" \
+  -d '{
+    "customerId": "cus_xxx",
+    "subscriptionId": "sub_xxx",
+    "lineItems": [
+      {
+        "description": "Pro Plan - January 2025",
+        "quantity": 1,
+        "unitAmount": 2999
+      }
+    ],
+    "tax": 240,
+    "dueDate": "2025-02-01"
+  }'
+
+# List invoices
+curl http://localhost:3000/invoices?status=OPEN \
+  -H "x-tenant-id: tenant_xxx"
+
+# Mark invoice as paid
+curl -X POST http://localhost:3000/invoices/inv_xxx/pay
+```
+
+### Payment Methods
+
+Manage customer payment methods:
+
+```bash
+# Add a payment method
+curl -X POST http://localhost:3000/payment-methods \
+  -H "Content-Type: application/json" \
+  -H "x-tenant-id: tenant_xxx" \
+  -d '{
+    "customerId": "cus_xxx",
+    "type": "CARD",
+    "cardLast4": "4242",
+    "cardBrand": "visa",
+    "cardExpMonth": 12,
+    "cardExpYear": 2025,
+    "isDefault": true
+  }'
+
+# Get customer payment methods
+curl http://localhost:3000/payment-methods/customer/cus_xxx
+
+# Set as default
+curl -X POST http://localhost:3000/payment-methods/pm_xxx/set-default
+
+# Check expiring cards
+curl http://localhost:3000/payment-methods/expiring
+```
+
+### Usage-Based Billing
+
+Record and track metered usage:
+
+```bash
+# Record usage
+curl -X POST http://localhost:3000/usage \
+  -H "Content-Type: application/json" \
+  -H "x-tenant-id: tenant_xxx" \
+  -d '{
+    "subscriptionId": "sub_xxx",
+    "quantity": 1000,
+    "unit": "api_requests",
+    "idempotencyKey": "usage_20250118_001"
+  }'
+
+# Get usage aggregation
+curl http://localhost:3000/usage/subscription/sub_xxx/aggregate?startDate=2025-01-01&endDate=2025-01-31
+
+# Get customer usage
+curl http://localhost:3000/usage/customer/cus_xxx
+```
+
+### Transaction Tracking
+
+Track payments, refunds, and revenue:
+
+```bash
+# List transactions
+curl http://localhost:3000/transactions?type=CHARGE&status=SUCCEEDED \
+  -H "x-tenant-id: tenant_xxx"
+
+# Get revenue report
+curl http://localhost:3000/transactions/revenue?startDate=2025-01-01&endDate=2025-01-31 \
+  -H "x-tenant-id: tenant_xxx"
+
+# Get customer transactions
+curl http://localhost:3000/transactions/customer/cus_xxx
+```
+
 ## Architecture Overview
 
 ```
@@ -328,12 +452,35 @@ npm test
 Tests cover:
 - **TenantsService**: CRUD operations, validation, error handling
 - **PaymentsService**: Customer creation, subscription lifecycle
+- **InvoicesService**: Invoice creation, payment, voiding, line items
+- **PaymentMethodsService**: Payment method management, default setting, removal
+- **UsageService**: Usage recording, aggregation, idempotency, thresholds
+- **TransactionsService**: Transaction tracking, revenue calculation (coming soon)
 - **Domain Logic**: Status mapping, provider abstraction
 
 Coverage report:
 ```bash
 npm run test:cov
 ```
+
+### Test Examples
+
+```typescript
+// Example: Testing invoice creation
+it('should create an invoice with line items', async () => {
+  const dto = {
+    customerId: 'cus_1',
+    lineItems: [
+      { description: 'Test Item', quantity: 1, unitAmount: 1000 }
+    ],
+    tax: 100,
+  };
+
+  const result = await service.create('tenant_1', dto);
+
+  expect(result.total).toBe(1100);
+  expect(result.status).toBe(InvoiceStatus.DRAFT);
+});
 
 ## Integration Guide
 
@@ -422,18 +569,32 @@ NEXT_PUBLIC_API_URL=http://localhost:3000
 
 ## Future Extensions
 
+### Completed in Phase 3
+- [x] **Invoice Management**: Full CRUD with line items and payment tracking
+- [x] **Payment Methods**: Card/bank account management with expiry detection
+- [x] **Transaction Tracking**: Payment, refund, and revenue reporting
+- [x] **Usage-Based Billing**: Metered billing with idempotency and thresholds
+- [x] **Event-Driven Architecture**: Domain events with pluggable handlers
+- [x] **Adapter Pattern**: Notification and metrics abstraction
+- [x] **Audit Logs**: Comprehensive audit trail model
+- [x] **Webhook Tracking**: Webhook delivery status and retry monitoring
+
+### Planned Enhancements
 - [ ] **Complete PayPal Integration**: Implement all PayPal provider methods
 - [ ] **Japanese Payment Gateways**: Add GMO Payment, PAY.JP, etc.
-- [ ] **Customer Portal**: Self-service subscription management
-- [ ] **Usage-Based Billing**: Track and bill by usage metrics
+- [ ] **Customer Portal**: Self-service subscription management UI
+- [ ] **Credits System**: Full credit application and expiration logic
 - [ ] **Multi-Currency**: Support multiple currencies per tenant
 - [ ] **Dunning Management**: Automatic retry logic for failed payments
-- [ ] **Analytics Dashboard**: Revenue metrics, churn analysis
-- [ ] **Webhook Retry Logic**: Exponential backoff for failed webhooks
-- [ ] **Audit Logs**: Track all API operations for compliance
-- [ ] **Rate Limiting**: Protect API endpoints
+- [ ] **Analytics Dashboard**: Revenue metrics, MRR, churn analysis
+- [ ] **Webhook Retry Logic**: Exponential backoff implementation
+- [ ] **Rate Limiting**: Protect API endpoints with configurable limits
 - [ ] **API Documentation**: Swagger/OpenAPI integration
 - [ ] **E2E Tests**: Playwright for admin UI testing
+- [ ] **CLI Tool**: Command-line tool for tenant/subscription management
+- [ ] **Export API**: Bulk data export for reporting/analytics
+- [ ] **GDPR Compliance**: Data export, deletion, and anonymization
+- [ ] **Advanced Notifications**: Email templates, SMS, push notifications
 
 ## Troubleshooting
 
