@@ -23,11 +23,14 @@ enum SubscriptionStatus {
   TRIALING
   INCOMPLETE
   INCOMPLETE_EXPIRED
+  PAUSED
 }
 
 enum BillingInterval {
   MONTH
   YEAR
+  WEEK
+  DAY
 }
 
 enum PaymentEventType {
@@ -40,19 +43,77 @@ enum PaymentEventType {
   INVOICE_PAYMENT_FAILED
   PAYMENT_METHOD_ATTACHED
   PAYMENT_METHOD_DETACHED
+  CHARGE_SUCCEEDED
+  CHARGE_FAILED
+  REFUND_CREATED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  VOID
+  UNCOLLECTIBLE
+}
+
+enum TransactionType {
+  CHARGE
+  REFUND
+  PAYOUT
+  ADJUSTMENT
+  CREDIT_APPLIED
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+enum PaymentMethodType {
+  CARD
+  BANK_ACCOUNT
+  PAYPAL
+  ACH
+  SEPA
+}
+
+enum WebhookStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  RETRY
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  VIEW
+  EXPORT
 }
 
 model Tenant {
   id            String         @id @default(cuid())
   name          String
   apiKey        String         @unique @default(cuid())
+  settings      Json?          // Tenant-specific settings
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
 
-  customers     Customer[]
-  plans         Plan[]
-  subscriptions Subscription[]
-  paymentEvents PaymentEvent[]
+  customers      Customer[]
+  plans          Plan[]
+  subscriptions  Subscription[]
+  paymentEvents  PaymentEvent[]
+  invoices       Invoice[]
+  paymentMethods PaymentMethod[]
+  transactions   Transaction[]
+  credits        Credit[]
+  usageRecords   UsageRecord[]
+  webhooks       Webhook[]
+  auditLogs      AuditLog[]
 
   @@map("tenants")
 }
@@ -63,12 +124,22 @@ model Customer {
   externalCustomerId String          // Stripe customer ID or PayPal customer ID
   provider           PaymentProvider
   email              String
-  metadataJson       Json?           // Store additional customer metadata
+  name               String?
+  phone              String?
+  address            Json?           // Billing address
+  metadataJson       Json?
+  defaultPaymentMethodId String?
+  balance            Int             @default(0) // Customer balance in smallest currency unit
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
 
-  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  subscriptions Subscription[]
+  tenant         Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  subscriptions  Subscription[]
+  invoices       Invoice[]
+  paymentMethods PaymentMethod[]
+  transactions   Transaction[]
+  credits        Credit[]
+  usageRecords   UsageRecord[]
 
   @@unique([tenantId, externalCustomerId, provider])
   @@index([tenantId])
@@ -77,22 +148,29 @@ model Customer {
 }
 
 model Plan {
-  id                 String          @id @default(cuid())
-  tenantId           String
-  name               String
-  price              Int             // Store in smallest currency unit (cents)
-  currency           String          @default("usd")
-  billingInterval    BillingInterval
-  providerPlanIdsJson Json           // { "stripe": "price_xxx", "paypal": "plan_xxx" }
-  description        String?
-  isActive           Boolean         @default(true)
-  createdAt          DateTime        @default(now())
-  updatedAt          DateTime        @updatedAt
+  id                  String          @id @default(cuid())
+  tenantId            String
+  name                String
+  price               Int             // Base price in smallest currency unit
+  currency            String          @default("usd")
+  billingInterval     BillingInterval
+  intervalCount       Int             @default(1) // e.g. every 3 months
+  providerPlanIdsJson Json            // { "stripe": "price_xxx", "paypal": "plan_xxx" }
+  description         String?
+  features            Json?           // Array of feature descriptions
+  isActive            Boolean         @default(true)
+  trialPeriodDays     Int?
+  usageType           String?         // "metered" or "licensed"
+  metadataJson        Json?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
 
   tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   subscriptions Subscription[]
+  usageRecords  UsageRecord[]
 
   @@index([tenantId])
+  @@index([isActive])
   @@map("plans")
 }
 
@@ -106,15 +184,22 @@ model Subscription {
   currentPeriodEnd       DateTime
   cancelAt               DateTime?
   canceledAt             DateTime?
-  providerSubscriptionId String             // Stripe subscription ID or PayPal subscription ID
+  trialStart             DateTime?
+  trialEnd               DateTime?
+  providerSubscriptionId String
   provider               PaymentProvider
-  metadataJson           Json?              // Store additional subscription metadata
+  quantity               Int                @default(1)
+  collectionMethod       String?            // charge_automatically, send_invoice
+  daysUntilDue           Int?
+  metadataJson           Json?
   createdAt              DateTime           @default(now())
   updatedAt              DateTime           @updatedAt
 
-  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
-  plan     Plan     @relation(fields: [planId], references: [id], onDelete: Restrict)
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer     Customer      @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  plan         Plan          @relation(fields: [planId], references: [id], onDelete: Restrict)
+  invoices     Invoice[]
+  usageRecords UsageRecord[]
 
   @@unique([providerSubscriptionId, provider])
   @@index([tenantId])
@@ -123,12 +208,210 @@ model Subscription {
   @@map("subscriptions")
 }
 
+model Invoice {
+  id                   String        @id @default(cuid())
+  tenantId             String
+  customerId           String
+  subscriptionId       String?
+  providerInvoiceId    String?
+  provider             PaymentProvider
+  status               InvoiceStatus
+  number               String?       // Human-readable invoice number
+  amountDue            Int           // Total amount in smallest currency unit
+  amountPaid           Int           @default(0)
+  amountRemaining      Int           // Remaining balance
+  currency             String        @default("usd")
+  tax                  Int?          // Tax amount
+  subtotal             Int           // Pre-tax subtotal
+  total                Int           // Final total with tax
+  description          String?
+  dueDate              DateTime?
+  paidAt               DateTime?
+  voidedAt             DateTime?
+  attemptedAt          DateTime?
+  hostedInvoiceUrl     String?
+  invoicePdfUrl        String?
+  metadataJson         Json?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  tenant       Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer     Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  subscription Subscription?     @relation(fields: [subscriptionId], references: [id])
+  lineItems    InvoiceLineItem[]
+  transactions Transaction[]
+
+  @@index([tenantId])
+  @@index([customerId])
+  @@index([subscriptionId])
+  @@index([status])
+  @@index([dueDate])
+  @@map("invoices")
+}
+
+model InvoiceLineItem {
+  id          String   @id @default(cuid())
+  invoiceId   String
+  description String
+  quantity    Int      @default(1)
+  unitAmount  Int      // Price per unit in smallest currency unit
+  amount      Int      // Total amount for this line (quantity * unitAmount)
+  currency    String   @default("usd")
+  period      Json?    // { start, end } for subscription periods
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@map("invoice_line_items")
+}
+
+model PaymentMethod {
+  id                       String            @id @default(cuid())
+  tenantId                 String
+  customerId               String
+  providerPaymentMethodId  String
+  provider                 PaymentProvider
+  type                     PaymentMethodType
+  isDefault                Boolean           @default(false)
+  card                     Json?             // Card details (last4, brand, exp)
+  bankAccount              Json?             // Bank account details
+  billingDetails           Json?             // Name, email, address
+  metadataJson             Json?
+  expiresAt                DateTime?
+  createdAt                DateTime          @default(now())
+  updatedAt                DateTime          @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([customerId])
+  @@index([isDefault])
+  @@map("payment_methods")
+}
+
+model Transaction {
+  id                    String            @id @default(cuid())
+  tenantId              String
+  customerId            String
+  invoiceId             String?
+  providerTransactionId String?
+  provider              PaymentProvider
+  type                  TransactionType
+  status                TransactionStatus
+  amount                Int               // Amount in smallest currency unit
+  currency              String            @default("usd")
+  fee                   Int?              // Processing fee
+  net                   Int?              // Net amount after fees
+  description           String?
+  failureCode           String?
+  failureMessage        String?
+  metadataJson          Json?
+  processedAt           DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  invoice  Invoice?  @relation(fields: [invoiceId], references: [id])
+
+  @@index([tenantId])
+  @@index([customerId])
+  @@index([invoiceId])
+  @@index([status])
+  @@index([type])
+  @@index([createdAt])
+  @@map("transactions")
+}
+
+model Credit {
+  id             String          @id @default(cuid())
+  tenantId       String
+  customerId     String
+  amount         Int             // Credit amount in smallest currency unit
+  currency       String          @default("usd")
+  remaining      Int             // Remaining balance
+  description    String?
+  reason         String?         // refund, promotion, adjustment
+  providerCreditId String?
+  provider       PaymentProvider?
+  expiresAt      DateTime?
+  appliedAt      DateTime?
+  metadataJson   Json?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([customerId])
+  @@index([expiresAt])
+  @@map("credits")
+}
+
+model UsageRecord {
+  id             String          @id @default(cuid())
+  tenantId       String
+  customerId     String
+  subscriptionId String
+  planId         String
+  quantity       Float           // Usage quantity (e.g., API calls, GB, hours)
+  unit           String          // Unit of measurement
+  timestamp      DateTime
+  description    String?
+  metadataJson   Json?
+  providerUsageRecordId String?
+  provider       PaymentProvider?
+  createdAt      DateTime        @default(now())
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer     Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  plan         Plan         @relation(fields: [planId], references: [id])
+
+  @@index([tenantId])
+  @@index([customerId])
+  @@index([subscriptionId])
+  @@index([timestamp])
+  @@map("usage_records")
+}
+
+model Webhook {
+  id            String        @id @default(cuid())
+  tenantId      String
+  provider      PaymentProvider
+  eventType     String
+  status        WebhookStatus
+  payload       Json
+  signature     String?
+  attempts      Int           @default(0)
+  lastAttemptAt DateTime?
+  nextRetryAt   DateTime?
+  succeededAt   DateTime?
+  failedAt      DateTime?
+  error         String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([provider])
+  @@index([status])
+  @@index([nextRetryAt])
+  @@index([createdAt])
+  @@map("webhooks")
+}
+
 model PaymentEvent {
   id          String           @id @default(cuid())
   tenantId    String
   provider    PaymentProvider
   type        PaymentEventType
-  payloadJson Json             // Store the full webhook payload
+  payloadJson Json
   processedAt DateTime?
   createdAt   DateTime         @default(now())
 
@@ -139,4 +422,26 @@ model PaymentEvent {
   @@index([type])
   @@index([createdAt])
   @@map("payment_events")
+}
+
+model AuditLog {
+  id           String      @id @default(cuid())
+  tenantId     String
+  userId       String?     // If user-initiated
+  action       AuditAction
+  entityType   String      // e.g., "subscription", "invoice"
+  entityId     String
+  changes      Json?       // Before/after values
+  ipAddress    String?
+  userAgent    String?
+  metadataJson Json?
+  createdAt    DateTime    @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@index([createdAt])
+  @@map("audit_logs")
 }
